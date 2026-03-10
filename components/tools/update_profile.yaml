@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Tool
+metadata:
+  name: update_profile
+  label:
+    en_US: UpdateProfile
+    zh_Hans: 更新画像
+  description:
+    en_US: Update the session's core profile information.
+    zh_Hans: 更新当前会话的核心画像信息。
+
+spec:
+  parameters:
+    type: object
+    properties:
+      field:
+        type: string
+        enum:
+          - name
+          - traits
+          - preferences
+          - notes
+        description: Which profile field to update.
+      action:
+        type: string
+        enum:
+          - set
+          - add
+          - remove
+        description: "set: replace the value. add: append to the list. remove: remove from the list."
+      value:
+        type: string
+        description: The value to set/add/remove.
+    required:
+      - field
+      - action
+      - value
+
+  llm_prompt: |
+    Update the session profile — shared context about this conversation (group chat or private chat).
+    This profile is visible to the bot across all interactions in this session.
+
+    Fields:
+    - name: A label for this session or the user's preferred name (in private chat).
+    - traits: Key facts about participants or the session (e.g. "Alice is a software engineer", "group for project X").
+    - preferences: Communication preferences (e.g. "respond in Chinese", "no emojis", "be concise").
+    - notes: Free-form notes about this session.
+
+    Actions:
+    - set: Replace the field value entirely.
+    - add: Add an item to a list field (traits/preferences) or append to notes.
+    - remove: Remove an item from a list field or clear notes.
+
+    When adding traits about specific people, include their name (e.g. "Alice likes coffee" not just "likes coffee").
+    For specific events or temporal facts, use the "remember" tool instead.
+
+execution:
+  python:
+    path: update_profile.py
+    attr: UpdateProfile
