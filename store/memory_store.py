@@ -68,10 +68,11 @@ class MemoryStore:
 
     @staticmethod
     def get_session_key(launcher_type_value: str, launcher_id: Any) -> str:
-        # Note: this does not include platform type (qq/wechat/...), so if the
-        # same launcher_id exists on different platforms, their memories would
-        # collide. In practice this is unlikely since different platforms use
-        # different ID schemes.
+        # This key does not include platform type (qq/wechat/...). Under the
+        # current deployment assumption, memory plugin instances are effectively
+        # scoped to a specific bot/runtime environment, and bots are expected to
+        # be separated by platform, so cross-platform collisions are not
+        # considered a practical issue here.
         return f"{launcher_type_value}_{launcher_id}"
 
     @staticmethod
@@ -223,6 +224,8 @@ class MemoryStore:
         tags: list[str] | None = None,
         importance: int = 2,
         source: str = "agent",
+        sender_id: str = "",
+        sender_name: str = "",
     ) -> dict[str, Any]:
         """Store an episodic memory into vector DB."""
         episode_id = uuid.uuid4().hex[:12]
@@ -237,6 +240,8 @@ class MemoryStore:
             "timestamp": timestamp,
             "user_key": user_key,
             "source": source,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
         }
 
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, [content])
@@ -264,6 +269,12 @@ class MemoryStore:
         query: str,
         user_key: str | None = None,
         top_k: int = 5,
+        sender_id: str = "",
+        sender_name: str = "",
+        time_after: str = "",
+        time_before: str = "",
+        importance_min: int | None = None,
+        source: str = "",
     ) -> list[dict[str, Any]]:
         """Search episodic memories via vector similarity."""
         if not query.strip():
@@ -275,6 +286,21 @@ class MemoryStore:
         filters = {}
         if user_key:
             filters["user_key"] = user_key
+        if sender_id:
+            filters["sender_id"] = sender_id
+        if sender_name:
+            filters["sender_name"] = sender_name
+        if source:
+            filters["source"] = source
+        if time_after or time_before:
+            time_filter: dict[str, str] = {}
+            if time_after:
+                time_filter["$gte"] = time_after
+            if time_before:
+                time_filter["$lte"] = time_before
+            filters["timestamp"] = time_filter
+        if importance_min is not None:
+            filters["importance"] = {"$gte": str(importance_min)}
 
         results = await self.plugin.vector_search(
             collection_id=collection_id,
@@ -292,6 +318,9 @@ class MemoryStore:
                 "tags": meta.get("tags", "").split(",") if meta.get("tags") else [],
                 "importance": int(meta.get("importance", "2")),
                 "timestamp": meta.get("timestamp", ""),
+                "sender_id": meta.get("sender_id", ""),
+                "sender_name": meta.get("sender_name", ""),
+                "source": meta.get("source", ""),
                 "score": r.get("score"),
             })
         return episodes

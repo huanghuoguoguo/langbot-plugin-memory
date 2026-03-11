@@ -5,6 +5,7 @@ from typing import Any
 
 from langbot_plugin.api.definition.components.tool.tool import Tool
 from langbot_plugin.api.entities.builtin.provider import session as provider_session
+from langbot_plugin.api.proxies.query_based_api import QueryBasedAPIProxy
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,10 @@ class Remember(Tool):
         query_id: int,
     ) -> str:
         store = self.plugin.memory_store
-        session_key, user_key, kb_id, isolation, config = (
-            await store.resolve_user_context(session)
+        _, user_key, kb_id, _, config = await store.resolve_user_context(session)
+        api = QueryBasedAPIProxy(
+            query_id=query_id,
+            plugin_runtime_handler=self.plugin.plugin_runtime_handler,
         )
 
         if not kb_id:
@@ -35,6 +38,9 @@ class Remember(Tool):
 
         tags = params.get("tags", [])
         importance = params.get("importance", 2)
+        query_vars = await api.get_query_vars()
+        sender_id = str(session.sender_id or "")
+        sender_name = str(query_vars.get("sender_name", "") or "")
 
         episode = await store.add_episode(
             collection_id=kb_id,
@@ -43,6 +49,8 @@ class Remember(Tool):
             content=content,
             tags=tags,
             importance=importance,
+            sender_id=sender_id,
+            sender_name=sender_name,
         )
 
         logger.info(
