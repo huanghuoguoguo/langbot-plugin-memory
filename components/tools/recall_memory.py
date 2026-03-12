@@ -5,6 +5,7 @@ from typing import Any
 
 from langbot_plugin.api.definition.components.tool.tool import Tool
 from langbot_plugin.api.entities.builtin.provider import session as provider_session
+from langbot_plugin.api.proxies.query_based_api import QueryBasedAPIProxy
 
 
 class RecallMemory(Tool):
@@ -16,10 +17,21 @@ class RecallMemory(Tool):
         query_id: int,
     ) -> str:
         store = self.plugin.memory_store
-        _, user_key, kb_id, _, config = await store.resolve_user_context(session)
+        api = QueryBasedAPIProxy(
+            query_id=query_id,
+            plugin_runtime_handler=self.plugin.plugin_runtime_handler,
+        )
+        bot_uuid = await api.get_bot_uuid()
+        _, user_key, kb_id, _isolation, config = await store.resolve_user_context(
+            session, bot_uuid
+        )
 
         if not kb_id:
             return "Error: no memory knowledge base configured. Create one first."
+
+        pipeline_kbs = await api.list_pipeline_knowledge_bases()
+        if not any(kb.get("uuid") == kb_id for kb in pipeline_kbs):
+            return "Error: memory knowledge base is not configured for the current pipeline."
 
         embedding_model_uuid = config.get("embedding_model_uuid", "")
         if not embedding_model_uuid:

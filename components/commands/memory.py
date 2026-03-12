@@ -1,18 +1,67 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, NamedTuple
 
 from langbot_plugin.api.definition.components.command.command import Command
 from langbot_plugin.api.entities.builtin.command.context import (
-    ExecuteContext,
     CommandReturn,
+    ExecuteContext,
 )
+from langbot_plugin.api.proxies.query_based_api import QueryBasedAPIProxy
 
 logger = logging.getLogger(__name__)
 
 
+class _RuntimeContext(NamedTuple):
+    api: QueryBasedAPIProxy
+    bot_uuid: str
+    query_vars: dict
+    session_key: str
+    user_key: str
+    kb_id: str | None
+    isolation: str
+    config: dict
+
+
 class Memory(Command):
+
+    @staticmethod
+    async def _build_runtime_context(
+        plugin,
+        context: ExecuteContext,
+    ) -> _RuntimeContext:
+        store = plugin.memory_store
+        api = QueryBasedAPIProxy(
+            query_id=context.query_id,
+            plugin_runtime_handler=plugin.plugin_runtime_handler,
+        )
+        bot_uuid = await api.get_bot_uuid()
+        query_vars = await api.get_query_vars()
+        session_key, user_key, kb_id, isolation, config = (
+            await store.resolve_user_context(context.session, bot_uuid)
+        )
+        return _RuntimeContext(
+            api=api,
+            bot_uuid=bot_uuid,
+            query_vars=query_vars,
+            session_key=session_key,
+            user_key=user_key,
+            kb_id=kb_id,
+            isolation=isolation,
+            config=config,
+        )
+
+    @staticmethod
+    async def _is_memory_kb_active(
+        store,
+        api: QueryBasedAPIProxy,
+        kb_id: str | None,
+    ) -> bool:
+        if not kb_id:
+            return False
+        pipeline_kbs = await api.list_pipeline_knowledge_bases()
+        return any(kb.get("uuid") == kb_id for kb in pipeline_kbs)
 
     def __init__(self):
         super().__init__()
@@ -24,31 +73,50 @@ class Memory(Command):
             aliases=[],
         )
         async def root(
-            self, context: ExecuteContext
+            self: Memory,
+            context: ExecuteContext,
         ) -> AsyncGenerator[CommandReturn, None]:
             store = self.plugin.memory_store
-            session_key, user_key, kb_id, isolation, _ = (
-                await store.resolve_user_context(context.session)
+            ctx = await self._build_runtime_context(self.plugin, context)
+
+            sender_id = str(ctx.query_vars.get("sender_id", "") or "")
+            session_profile = await store.load_session_profile(ctx.session_key)
+            speaker_profile = (
+                await store.load_speaker_profile(ctx.session_key, sender_id)
+                if sender_id
+                else {}
+            )
+            kb_active = await self._is_memory_kb_active(store, ctx.api, ctx.kb_id)
+
+            lines = [f"[Memory] mode: {ctx.isolation}"]
+            lines.append(f"Session: {ctx.session_key}")
+            lines.append(f"Key: {ctx.user_key}")
+            lines.append(
+                f"Current speaker: {ctx.query_vars.get('sender_name') or '-'} ({sender_id or '-'})"
             )
 
-            profile = await store.load_profile(user_key)
-
-            lines = [f"[Memory] mode: {isolation}"]
-            lines.append(f"Session: {session_key}")
-            lines.append(f"Key: {user_key}")
-
-            has_profile = store.has_profile_data(profile)
-            if has_profile:
+            if store.has_profile_data(session_profile):
                 lines.append(
-                    f"Profile: name={profile.get('name', '-')}, "
-                    f"{len(profile.get('traits', []))} traits, "
-                    f"{len(profile.get('preferences', []))} prefs"
+                    f"Session profile: name={session_profile.get('name', '-')}, "
+                    f"{len(session_profile.get('traits', []))} traits, "
+                    f"{len(session_profile.get('preferences', []))} prefs"
                 )
             else:
-                lines.append("Profile: (empty)")
+                lines.append("Session profile: (empty)")
 
-            if kb_id:
-                lines.append(f"L2 (Episodic): KB={kb_id[:12]}... active")
+            if sender_id and store.has_profile_data(speaker_profile):
+                lines.append(
+                    f"Speaker profile: name={speaker_profile.get('name', '-')}, "
+                    f"{len(speaker_profile.get('traits', []))} traits, "
+                    f"{len(speaker_profile.get('preferences', []))} prefs"
+                )
+            elif sender_id:
+                lines.append("Speaker profile: (empty)")
+
+            if ctx.kb_id and kb_active:
+                lines.append(f"L2 (Episodic): KB={ctx.kb_id[:12]}... active")
+            elif ctx.kb_id:
+                lines.append(f"L2 (Episodic): KB={ctx.kb_id[:12]}... configured but inactive in this pipeline")
             else:
                 lines.append("L2 (Episodic): no KB configured")
 
@@ -56,26 +124,44 @@ class Memory(Command):
 
         @self.subcommand(
             name="profile",
-            help="Show session profile",
+            help="Show session and speaker profiles",
             usage="!memory profile",
             aliases=["p"],
         )
         async def profile_cmd(
-            self, context: ExecuteContext
+            self: Memory,
+            context: ExecuteContext,
         ) -> AsyncGenerator[CommandReturn, None]:
             store = self.plugin.memory_store
-            user_key = await store.resolve_user_key(context.session)
+            ctx = await self._build_runtime_context(self.plugin, context)
 
-            profile = await store.load_profile(user_key)
-            lines = ["[Profile]"]
-            lines.append(f"Name: {profile.get('name') or '(not set)'}")
+            sender_id = str(ctx.query_vars.get("sender_id", "") or "")
+            session_profile = await store.load_session_profile(ctx.session_key)
+
+            lines = ["[Session Profile]"]
+            lines.append(f"Name: {session_profile.get('name') or '(not set)'}")
             lines.append(
-                f"Traits: {', '.join(profile.get('traits', [])) or '(none)'}"
+                f"Traits: {', '.join(session_profile.get('traits', [])) or '(none)'}"
             )
             lines.append(
-                f"Preferences: {', '.join(profile.get('preferences', [])) or '(none)'}"
+                "Preferences: "
+                f"{', '.join(session_profile.get('preferences', [])) or '(none)'}"
             )
-            lines.append(f"Notes: {profile.get('notes') or '(none)'}")
+            lines.append(f"Notes: {session_profile.get('notes') or '(none)'}")
+
+            if sender_id:
+                speaker_profile = await store.load_speaker_profile(ctx.session_key, sender_id)
+                lines.append("")
+                lines.append("[Current Speaker Profile]")
+                lines.append(f"Name: {speaker_profile.get('name') or '(not set)'}")
+                lines.append(
+                    f"Traits: {', '.join(speaker_profile.get('traits', [])) or '(none)'}"
+                )
+                lines.append(
+                    "Preferences: "
+                    f"{', '.join(speaker_profile.get('preferences', [])) or '(none)'}"
+                )
+                lines.append(f"Notes: {speaker_profile.get('notes') or '(none)'}")
 
             yield CommandReturn(text="\n".join(lines))
 
@@ -86,21 +172,19 @@ class Memory(Command):
             aliases=["s"],
         )
         async def search_cmd(
-            self, context: ExecuteContext
+            self: Memory,
+            context: ExecuteContext,
         ) -> AsyncGenerator[CommandReturn, None]:
             store = self.plugin.memory_store
-            _, user_key, kb_id, _, config = (
-                await store.resolve_user_context(context.session)
-            )
+            ctx = await self._build_runtime_context(self.plugin, context)
 
-            if not kb_id:
+            if not ctx.kb_id or not await self._is_memory_kb_active(store, ctx.api, ctx.kb_id):
                 yield CommandReturn(
-                    text="[Memory] No knowledge base configured. "
-                    "Cannot search episodic memories."
+                    text="[Memory] Memory knowledge base is not configured for the current pipeline."
                 )
                 return
 
-            embedding_model_uuid = config.get("embedding_model_uuid", "")
+            embedding_model_uuid = ctx.config.get("embedding_model_uuid", "")
 
             if not context.crt_params:
                 yield CommandReturn(text="Usage: !memory search <query>")
@@ -109,10 +193,10 @@ class Memory(Command):
             query = " ".join(context.crt_params)
 
             episodes = await store.search_episodes(
-                collection_id=kb_id,
+                collection_id=ctx.kb_id,
                 embedding_model_uuid=embedding_model_uuid,
                 query=query,
-                user_key=user_key,
+                user_key=ctx.user_key,
                 top_k=10,
             )
 

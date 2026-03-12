@@ -13,6 +13,12 @@ spec:
   parameters:
     type: object
     properties:
+      scope:
+        type: string
+        enum:
+          - session
+          - speaker
+        description: "session: shared profile for the whole chat. speaker: profile for the current speaker."
       field:
         type: string
         enum:
@@ -38,20 +44,29 @@ spec:
 
   llm_prompt: |
     Update the session profile — shared context about this conversation (group chat or private chat).
-    This profile is visible to the bot across all interactions in this session.
+    This tool can update either:
+    - the shared session profile for the whole chat
+    - the current speaker's profile for person-specific stable facts
 
     Fields:
-    - name: A label for this session or the user's preferred name (in private chat).
-    - traits: Key facts about participants or the session (e.g. "Alice is a software engineer", "group for project X").
-    - preferences: Communication preferences (e.g. "respond in Chinese", "no emojis", "be concise").
-    - notes: Free-form notes about this session.
+    - name: A label for this session, or a participant's preferred name.
+    - traits: Key stable facts about a participant or the session.
+    - preferences: Communication preferences for the current speaker or the whole session.
+    - notes: Free-form notes, usually shared session context.
+
+    Scopes:
+    - speaker: Use for stable facts about the current speaker, such as "Alice likes coffee" or "Alice is a software engineer".
+    - session: Use for shared context about the whole chat, such as "group for project X" or "respond in Chinese here".
 
     Actions:
     - set: Replace the field value entirely.
     - add: Add an item to a list field (traits/preferences) or append to notes.
     - remove: Remove an item from a list field or clear notes.
 
-    When adding traits about specific people, include their name (e.g. "Alice likes coffee" not just "likes coffee").
+    Important:
+    - When adding facts about a person in a group chat, prefer scope="speaker".
+    - When adding shared group context, use scope="session".
+    - When adding traits about specific people, include their name (e.g. "Alice likes coffee" not just "likes coffee").
     For specific events or temporal facts, use the "remember" tool instead.
 
 execution:

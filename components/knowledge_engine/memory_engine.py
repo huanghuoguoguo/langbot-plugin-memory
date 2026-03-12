@@ -61,6 +61,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
         collection_id = context.get_collection_id()
         settings = context.creation_settings
         retrieval_settings = context.retrieval_settings
+        store = self.plugin.memory_store
 
         embedding_model_uuid = settings.get("embedding_model_uuid", "")
         top_k = retrieval_settings.get("top_k", settings.get("max_results", 5))
@@ -74,22 +75,46 @@ class LongTermMemoryEngine(KnowledgeEngine):
         )
         query_vector = query_vectors[0]
 
-        # Build user_key filter based on isolation mode.
-        # session_name is passed via retrieval_settings (localagent.py -> kbmgr.py).
-        filters: dict[str, Any] | None = None
         session_name = retrieval_settings.get("session_name")
+        sender_id = str(retrieval_settings.get("sender_id", "") or "")
+        bot_uuid = str(retrieval_settings.get("bot_uuid", "") or "")
         isolation = settings.get("isolation", "session")
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
 
-        if isolation == "session" and session_name:
-            filters = {"user_key": session_name}
-        # isolation == "bot": no filter, return all memories
+        async def extend_results(filters: dict[str, Any] | None) -> None:
+            nonlocal results
+            batch = await self.plugin.vector_search(
+                collection_id=collection_id,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filters,
+            )
+            for item in batch:
+                item_id = item.get("id", "")
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                results.append(item)
+                if len(results) >= top_k:
+                    return
 
-        results = await self.plugin.vector_search(
-            collection_id=collection_id,
-            query_vector=query_vector,
-            top_k=top_k,
-            filters=filters,
-        )
+        if session_name:
+            scope_key = store.get_scope_key_from_session_name(
+                bot_uuid, session_name, isolation
+            )
+
+            if sender_id:
+                await extend_results({"user_key": scope_key, "sender_id": sender_id})
+
+            if len(results) < top_k:
+                await extend_results({"user_key": scope_key})
+        else:
+            # Preserve previous broad-search behavior if session context is absent.
+            await extend_results(None)
+
+        results = results[:top_k]
 
         entries: list[RetrievalResultEntry] = []
         for r in results:

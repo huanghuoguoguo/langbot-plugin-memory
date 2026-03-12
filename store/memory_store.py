@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -27,6 +28,8 @@ class MemoryStore:
     """
 
     _PROFILE_FIELDS = ("name", "traits", "preferences", "notes")
+    _MAX_PROFILE_CACHE_SIZE = 256
+    _MAX_NOTES_LENGTH = 2000
 
     def __init__(
         self,
@@ -67,22 +70,54 @@ class MemoryStore:
     # ======================== key helpers ========================
 
     @staticmethod
-    def get_session_key(launcher_type_value: str, launcher_id: Any) -> str:
-        # This key does not include platform type (qq/wechat/...). Under the
-        # current deployment assumption, memory plugin instances are effectively
-        # scoped to a specific bot/runtime environment, and bots are expected to
-        # be separated by platform, so cross-platform collisions are not
-        # considered a practical issue here.
-        return f"{launcher_type_value}_{launcher_id}"
+    def get_session_key(
+        bot_uuid: str,
+        launcher_type_value: str,
+        launcher_id: Any,
+    ) -> str:
+        session_id = f"{launcher_type_value}_{launcher_id}"
+        if not bot_uuid:
+            return session_id
+        return f"{bot_uuid}:{session_id}"
 
     @staticmethod
-    def get_user_key(session_key: str, isolation: str) -> str:
+    def get_user_key(session_key: str, isolation: str, bot_uuid: str = "") -> str:
         if isolation == "session":
             return session_key
+        if bot_uuid:
+            return f"bot:{bot_uuid}"
         return "global"
 
+    @classmethod
+    def get_scope_key(
+        cls,
+        bot_uuid: str,
+        launcher_type_value: str,
+        launcher_id: Any,
+        isolation: str,
+    ) -> str:
+        session_key = cls.get_session_key(bot_uuid, launcher_type_value, launcher_id)
+        return cls.get_user_key(session_key, isolation, bot_uuid)
+
+    @staticmethod
+    def split_session_name(session_name: str) -> tuple[str, str]:
+        launcher_type, sep, launcher_id = session_name.partition("_")
+        if not sep:
+            return session_name, ""
+        return launcher_type, launcher_id
+
+    @classmethod
+    def get_scope_key_from_session_name(
+        cls,
+        bot_uuid: str,
+        session_name: str,
+        isolation: str,
+    ) -> str:
+        launcher_type, launcher_id = cls.split_session_name(session_name)
+        return cls.get_scope_key(bot_uuid, launcher_type, launcher_id, isolation)
+
     async def resolve_user_context(
-        self, session: Any
+        self, session: Any, bot_uuid: str = ""
     ) -> tuple[str, str, str | None, str, dict[str, Any]]:
         """Derive session_key, user_key, kb_id, isolation from a session.
 
@@ -95,19 +130,19 @@ class MemoryStore:
             kb_id, config = kb
         isolation = config.get("isolation", "session")
         session_key = self.get_session_key(
-            session.launcher_type.value, session.launcher_id
+            bot_uuid, session.launcher_type.value, session.launcher_id
         )
-        user_key = self.get_user_key(session_key, isolation)
+        user_key = self.get_user_key(session_key, isolation, bot_uuid)
         return session_key, user_key, kb_id, isolation, config
 
-    async def resolve_user_key(self, session: Any) -> str:
+    async def resolve_user_key(self, session: Any, bot_uuid: str = "") -> str:
         """Derive user_key from a session object (lightweight, no kb_id/config)."""
         kb = await self.get_kb_config()
         isolation = kb[1].get("isolation", "session") if kb else "session"
         session_key = self.get_session_key(
-            session.launcher_type.value, session.launcher_id
+            bot_uuid, session.launcher_type.value, session.launcher_id
         )
-        return self.get_user_key(session_key, isolation)
+        return self.get_user_key(session_key, isolation, bot_uuid)
 
     # ======================== KB config persistence ========================
 
@@ -141,8 +176,11 @@ class MemoryStore:
 
     # ======================== L1: profile (Binary Storage) ========================
 
-    def _profile_key(self, user_key: str) -> str:
-        return f"p:{user_key}"
+    def _session_profile_key(self, scope_key: str) -> str:
+        return f"ps:{scope_key}"
+
+    def _speaker_profile_key(self, scope_key: str, sender_id: str) -> str:
+        return f"pp:{scope_key}:{sender_id}"
 
     async def _read_json(self, key: str) -> Any:
         try:
@@ -162,27 +200,52 @@ class MemoryStore:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         await self.plugin.set_plugin_storage(key, data)
 
-    async def load_profile(self, user_key: str) -> dict[str, Any]:
+    async def _load_profile_by_storage_key(self, storage_key: str) -> dict[str, Any]:
         now = time.monotonic()
-        cached = self._profile_cache.get(user_key)
+        cached = self._profile_cache.get(storage_key)
         if cached and now - cached[0] < self._PROFILE_CACHE_TTL:
             return cached[1]
-        key = self._profile_key(user_key)
-        profile = await self._read_json(key)
+
+        profile = await self._read_json(storage_key)
         profile = profile if profile else _default_profile()
-        self._profile_cache[user_key] = (now, profile)
+        if len(self._profile_cache) >= self._MAX_PROFILE_CACHE_SIZE:
+            self._profile_cache.clear()
+        self._profile_cache[storage_key] = (now, profile)
         return profile
 
-    async def save_profile(self, user_key: str, profile: dict[str, Any]) -> None:
+    async def _save_profile_by_storage_key(
+        self, storage_key: str, profile: dict[str, Any]
+    ) -> None:
         profile["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        key = self._profile_key(user_key)
-        await self._write_json(key, profile)
-        self._profile_cache[user_key] = (time.monotonic(), profile)
+        await self._write_json(storage_key, profile)
+        if len(self._profile_cache) >= self._MAX_PROFILE_CACHE_SIZE:
+            self._profile_cache.clear()
+        self._profile_cache[storage_key] = (time.monotonic(), profile)
 
-    async def update_profile_field(
-        self, user_key: str, field: str, action: str, value: str
+    async def load_session_profile(self, scope_key: str) -> dict[str, Any]:
+        return await self._load_profile_by_storage_key(
+            self._session_profile_key(scope_key)
+        )
+
+    async def load_speaker_profile(
+        self, scope_key: str, sender_id: str
     ) -> dict[str, Any]:
-        profile = await self.load_profile(user_key)
+        if not sender_id:
+            return _default_profile()
+        return await self._load_profile_by_storage_key(
+            self._speaker_profile_key(scope_key, sender_id)
+        )
+
+    async def _update_profile_field_by_storage_key(
+        self,
+        storage_key: str,
+        field: str,
+        action: str,
+        value: str,
+    ) -> dict[str, Any]:
+        profile = copy.deepcopy(
+            await self._load_profile_by_storage_key(storage_key)
+        )
 
         if field == "name":
             profile["name"] = value
@@ -200,18 +263,61 @@ class MemoryStore:
                 profile[field] = [value]
         elif field == "notes":
             if action == "set":
-                profile["notes"] = value
+                profile["notes"] = value[:self._MAX_NOTES_LENGTH]
             elif action == "add":
                 existing = profile.get("notes", "")
-                profile["notes"] = f"{existing}; {value}" if existing else value
+                new_notes = f"{existing}; {value}" if existing else value
+                if len(new_notes) > self._MAX_NOTES_LENGTH:
+                    new_notes = new_notes[:self._MAX_NOTES_LENGTH]
+                    logger.warning(
+                        "notes for %s truncated to %d chars",
+                        storage_key, self._MAX_NOTES_LENGTH,
+                    )
+                profile["notes"] = new_notes
             elif action == "remove":
                 profile["notes"] = ""
 
-        await self.save_profile(user_key, profile)
+        await self._save_profile_by_storage_key(storage_key, profile)
         return profile
 
-    async def clear_profile(self, user_key: str) -> None:
-        await self.save_profile(user_key, _default_profile())
+    async def update_session_profile_field(
+        self,
+        scope_key: str,
+        field: str,
+        action: str,
+        value: str,
+    ) -> dict[str, Any]:
+        return await self._update_profile_field_by_storage_key(
+            self._session_profile_key(scope_key),
+            field,
+            action,
+            value,
+        )
+
+    async def update_speaker_profile_field(
+        self,
+        scope_key: str,
+        sender_id: str,
+        field: str,
+        action: str,
+        value: str,
+    ) -> dict[str, Any]:
+        return await self._update_profile_field_by_storage_key(
+            self._speaker_profile_key(scope_key, sender_id),
+            field,
+            action,
+            value,
+        )
+
+    async def clear_session_profile(self, scope_key: str) -> None:
+        await self._save_profile_by_storage_key(
+            self._session_profile_key(scope_key), _default_profile()
+        )
+
+    async def clear_speaker_profile(self, scope_key: str, sender_id: str) -> None:
+        await self._save_profile_by_storage_key(
+            self._speaker_profile_key(scope_key, sender_id), _default_profile()
+        )
 
     # ======================== L2: episodes (ChromaDB vector) ========================
 
@@ -226,6 +332,7 @@ class MemoryStore:
         source: str = "agent",
         sender_id: str = "",
         sender_name: str = "",
+        bot_uuid: str = "",
     ) -> dict[str, Any]:
         """Store an episodic memory into vector DB."""
         episode_id = uuid.uuid4().hex[:12]
@@ -242,6 +349,7 @@ class MemoryStore:
             "source": source,
             "sender_id": sender_id,
             "sender_name": sender_name,
+            "bot_uuid": bot_uuid,
         }
 
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, [content])
@@ -300,6 +408,8 @@ class MemoryStore:
                 time_filter["$lte"] = time_before
             filters["timestamp"] = time_filter
         if importance_min is not None:
+            # importance is stored as a string ("1"-"5") in vector DB metadata;
+            # string comparison works correctly for single-digit values in this range.
             filters["importance"] = {"$gte": str(importance_min)}
 
         results = await self.plugin.vector_search(
@@ -337,12 +447,15 @@ class MemoryStore:
     # ======================== formatting ========================
 
     @staticmethod
-    def format_profile_prompt(profile: dict[str, Any]) -> str:
+    def format_profile_prompt(
+        profile: dict[str, Any],
+        title: str = "## Memory (Profile)",
+    ) -> str:
         if not MemoryStore.has_profile_data(profile):
             return ""
 
         parts: list[str] = []
-        parts.append("## Memory (Profile)")
+        parts.append(title)
 
         if profile.get("name"):
             parts.append(f"- Name: {profile['name']}")
